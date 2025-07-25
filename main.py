@@ -26,8 +26,6 @@ init_db()
 insert_initial_pricing_data()
 
 # Initialize Gemini LLM
-# Using 'gemini-1.5-flash' as per user's working configuration.
-# Temperature controls randomness: 0.0 for more deterministic, higher for more creative. For structured output, lower is better.
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.0)
 
 # Load pricing data from our SQLite database for the agents to use
@@ -38,59 +36,11 @@ pricing_context = "\n".join([
     for row in PRICING_DATA
 ])
 
-print("CustomCraft QuoteBot initialized. Ready to process requests.")
-
-# --- Human-in-the-Loop Functions ---
-def human_approval(data, step_name):
-    """
-    Prompts the human operator for approval or modification of AI-generated data.
-    Allows for 'y' (yes), 'n' (no/abort), or 'm' (modify JSON).
-    """
-    print(f"\n--- HUMAN APPROVAL REQUIRED: {step_name} ---")
-    # Check if data is already a string (e.g., for email draft)
-    if isinstance(data, dict):
-        print(f"Proposed data:\n{json.dumps(data, indent=2)}") # Pretty print JSON for readability
-    else: # Assume it's a string (like the email draft)
-        print(f"Proposed data:\n{data}")
-    
-    while True:
-        choice = input("Approve (y/n)? or (m)odify? ").lower()
-        if choice == 'y':
-            print(f"--- {step_name} APPROVED ---")
-            return data
-        elif choice == 'n':
-            print(f"--- {step_name} REJECTED. ABORTING. ---")
-            return None # Signal to abort the project workflow
-        elif choice == 'm':
-            print("Please provide the modified data. If it's JSON, ensure valid JSON. Type 'done' on a new line when finished.")
-            modified_input_str = ""
-            while True:
-                line = input()
-                if line.lower() == 'done':
-                    break
-                modified_input_str += line + "\n"
-            
-            # Attempt to parse as JSON if the original data was a dict, otherwise treat as string
-            if isinstance(data, dict):
-                try:
-                    modified_data = json.loads(modified_input_str)
-                    print("\nModified data received. Please review:")
-                    print(json.dumps(modified_data, indent=2))
-                    # Recursively call human_approval for the modified data to ensure it's also approved
-                    return human_approval(modified_data, step_name + " (Modified)")
-                except json.JSONDecodeError:
-                    print("Invalid JSON. Please try again.")
-            else: # Treat as plain string modification
-                print("\nModified data received. Please review:")
-                print(modified_input_str)
-                return human_approval(modified_input_str, step_name + " (Modified)")
-        else:
-            print("Invalid input. Please enter 'y', 'n', or 'm'.")
+print("CustomCraft QuoteBot backend initialized.") # Changed print for UI context
 
 # --- Agent Chains ---
 
 # --- Request Analyzer Agent ---
-# This chain extracts structured information from the customer's free-form request.
 extraction_prompt_template = ChatPromptTemplate.from_messages(
     [
         ("system",
@@ -127,28 +77,23 @@ extraction_prompt_template = ChatPromptTemplate.from_messages(
     ]
 )
 
-# Chain for extraction: Takes customer_request, passes to prompt, then LLM, then parses JSON.
 request_analyzer_chain = (
-    {"customer_request": RunnablePassthrough()} # Input is directly the customer request
+    {"customer_request": RunnablePassthrough()}
     | extraction_prompt_template
     | llm
-    | JsonOutputParser() # Expects and parses JSON output from the LLM
+    | JsonOutputParser()
 )
 
-def analyze_request_step(project_id, customer_request):
+def analyze_request(customer_request):
     """
-    Executes the Request Analyzer Agent to extract details and saves state.
+    Executes the Request Analyzer Agent to extract details.
+    Returns the extracted details (dict) or None on failure.
     """
-    print("\n[AI Agent] Analyzing customer request...")
     try:
         extracted_details = request_analyzer_chain.invoke(customer_request)
-        print("Extracted Details:", json.dumps(extracted_details, indent=2))
-        # Save extracted details as a JSON string in the database
-        save_project_state(project_id, extracted_details=json.dumps(extracted_details), status='pending_extraction_approval')
         return extracted_details
     except Exception as e:
-        print(f"Error analyzing request: {e}")
-        save_project_state(project_id, status='extraction_failed')
+        print(f"Error analyzing request: {e}") # Keep print for debug logs
         return None
 
 # --- Availability Checking Agent ---
@@ -158,9 +103,7 @@ def check_availability_tool(service_type):
     This acts as our 'tool' for the LLM.
     """
     today = datetime.date.today()
-    # Mock availability for the next few days
     if "installation" in service_type.lower() or "service" in service_type.lower() or "tune-up" in service_type.lower() or "repair" in service_type.lower():
-        # For installation/service, suggest specific dates/times
         return {
             "available_slots": [
                 {"date": str(today + datetime.timedelta(days=3)), "time": "9:00 AM - 12:00 PM"},
@@ -170,14 +113,12 @@ def check_availability_tool(service_type):
             "note": "These are preliminary availability slots. A representative will confirm exact timing."
         }
     else:
-        # For general inquiries or product-only requests, no specific slots needed
         return {
             "available_slots": [],
             "note": "No specific service installation/consultation requested, so no availability slots needed."
         }
 
 # --- Initial Quoting Agent ---
-# This chain generates an itemized quote based on extracted details and pricing data.
 quoting_prompt_template = ChatPromptTemplate.from_messages(
     [
         ("system",
@@ -226,32 +167,26 @@ quoting_prompt_template = ChatPromptTemplate.from_messages(
     ]
 )
 
-# Chain for quoting: Takes extracted_details and pricing_context, passes to prompt, then LLM, then parses JSON.
 initial_quoting_chain = (
     {
-        "extracted_details": RunnablePassthrough(), # Pass the extracted details directly
-        "pricing_context": lambda x: pricing_context # Inject the global pricing context
+        "extracted_details": RunnablePassthrough(),
+        "pricing_context": lambda x: pricing_context
     }
     | quoting_prompt_template
     | llm
-    | JsonOutputParser() # Expects and parses JSON output from the LLM
+    | JsonOutputParser()
 )
 
-def generate_quote_step(project_id, approved_details):
+def generate_quote(approved_details):
     """
-    Executes the Initial Quoting Agent to generate a quote draft and saves state.
+    Executes the Initial Quoting Agent to generate a quote draft.
+    Returns the quote draft (dict) or None on failure.
     """
-    print("\n[AI Agent] Generating initial quote...")
     try:
-        # The LLM needs the extracted_details as a string to process it in the prompt
         quote_draft = initial_quoting_chain.invoke({"extracted_details": json.dumps(approved_details)})
-        print("Quote Draft:", json.dumps(quote_draft, indent=2))
-        # Save quote draft as a JSON string in the database
-        save_project_state(project_id, quote_draft=json.dumps(quote_draft), status='pending_quote_approval')
         return quote_draft
     except Exception as e:
-        print(f"Error generating quote: {e}")
-        save_project_state(project_id, status='quote_failed')
+        print(f"Error generating quote: {e}") # Keep print for debug logs
         return None
 
 # --- Communication Drafter Agent ---
@@ -299,104 +234,28 @@ communication_drafter_chain = (
     }
     | email_prompt_template
     | llm
-    | StrOutputParser() # Expects and parses string output (the email text)
+    | StrOutputParser()
 )
 
-def draft_email_step(project_id, customer_request, extracted_details, final_quote, availability_info):
+def draft_email(customer_request, extracted_details, final_quote, availability_info):
     """
-    Executes the Communication Drafter Agent to draft an email and saves state.
+    Executes the Communication Drafter Agent to draft an email.
+    Returns the email draft (str) or None on failure.
     """
-    print("\n[AI Agent] Drafting customer email...")
     try:
-        # Pass all necessary context to the chain. Convert dicts to JSON strings for LLM processing.
         email_draft = communication_drafter_chain.invoke({
             "customer_request": customer_request,
             "extracted_details": json.dumps(extracted_details),
             "final_quote": json.dumps(final_quote),
             "availability_info": json.dumps(availability_info)
         })
-        print("\n--- Drafted Email ---")
-        print(email_draft)
-        # Save email draft to the database
-        save_project_state(project_id, email_draft=email_draft, status='pending_email_approval')
         return email_draft
     except Exception as e:
-        print(f"Error drafting email: {e}")
-        save_project_state(project_id, status='email_draft_failed')
+        print(f"Error drafting email: {e}") # Keep print for debug logs
         return None
 
-# --- Main Orchestration Logic ---
-def run_quotebot():
-    """
-    Orchestrates the entire workflow of the CustomCraft QuoteBot.
-    """
-    print("\nWelcome to CustomCraft QuoteBot!")
-    customer_request = input("Enter customer request (e.g., 'I need a new PP650 vacuum unit with installation and a 50ft retractable hose. Also, when can you install it?'):\n")
-    
-    # Create a new project in the database
-    project_id = create_new_project(customer_request)
-    print(f"New project created with ID: {project_id}")
-
-    # Step 1: Request Analysis
-    extracted_details = analyze_request_step(project_id, customer_request)
-    if extracted_details is None:
-        print("Request analysis failed or aborted.")
-        return
-
-    # Human-in-the-Loop for Extracted Details
-    approved_details = human_approval(extracted_details, "Extracted Details")
-    if approved_details is None:
-        print("Project aborted by human.")
-        save_project_state(project_id, status='aborted_by_human')
-        return
-    # Save the human-approved details back to the database
-    save_project_state(project_id, extracted_details=json.dumps(approved_details), status='extracted_details_approved')
-
-    # Step 2: Initial Quoting
-    quote_draft = generate_quote_step(project_id, approved_details)
-    if quote_draft is None:
-        print("Quote generation failed or aborted.")
-        return
-
-    # Human-in-the-Loop for Quote Draft
-    final_quote = human_approval(quote_draft, "Quote Draft")
-    if final_quote is None:
-        print("Project aborted by human.")
-        save_project_state(project_id, status='aborted_by_human')
-        return
-    # Save the human-approved final quote to the database
-    save_project_state(project_id, final_quote=json.dumps(final_quote), status='quote_approved')
-
-    # Step 3: Availability Checking (using the mock tool)
-    # Extract service names from quote_items for availability check
-    services_from_quote = final_quote.get("quote_items", [])
-    service_types_requested = [item.get("item", "") for item in services_from_quote if "service" in item.get("item", "").lower() or "installation" in item.get("item", "").lower() or "tune-up" in item.get("item", "").lower() or "repair" in item.get("item", "").lower()]
-    
-    availability_info = check_availability_tool(", ".join(service_types_requested))
-    print("\n[AI Agent] Checked Availability:")
-    print(json.dumps(availability_info, indent=2))
-    # Save availability info to project state for later use in email drafting
-    save_project_state(project_id, availability_info=json.dumps(availability_info), status='availability_checked')
-
-    # Step 4: Communication Drafter
-    email_draft = draft_email_step(project_id, customer_request, approved_details, final_quote, availability_info)
-    if email_draft is None:
-        print("Email drafting failed or aborted.")
-        return
-
-    # Human-in-the-Loop for Email Draft
-    final_email = human_approval(email_draft, "Final Email Draft")
-    if final_email is None:
-        print("Project aborted by human.")
-        save_project_state(project_id, status='aborted_by_human')
-        return
-    # Save the human-approved final email to the database
-    save_project_state(project_id, email_draft=final_email, status='email_approved')
-
-    print(f"\n--- Project {project_id} Completed! ---")
-    print("Final approved email is ready to be sent manually.")
-    save_project_state(project_id, status='completed')
-
-
-if __name__ == "__main__":
-    run_quotebot()
+# --- Main Orchestration Logic (Removed CLI-specific logic) ---
+# The run_quotebot function and direct execution (__name__ == "__main__")
+# will be moved to app.py to be driven by the Streamlit UI.
+# The init_db() and insert_initial_pricing_data() calls remain at the top
+# to ensure the database is always ready when main.py is imported.
